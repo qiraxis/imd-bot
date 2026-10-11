@@ -1523,6 +1523,119 @@ async function doRemoveRole(guild, moderator, target, role, reason) {
   };
 }
 
+function normalizeGradeRoleName(name) {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function getGradeRoleNames(name) {
+  const normalizedName = normalizeGradeRoleName(name);
+  const canonicalName = GRADE_ROLES.find(gradeName =>
+    normalizeGradeRoleName(gradeName) === normalizedName ||
+    (GRADE_ROLE_ALIASES[gradeName] || []).some(alias => normalizeGradeRoleName(alias) === normalizedName)
+  );
+  if (!canonicalName) return [];
+  return [canonicalName, ...(GRADE_ROLE_ALIASES[canonicalName] || [])]
+    .map(normalizeGradeRoleName);
+}
+
+function isGradeRole(roleName) {
+  return GRADE_ROLES.some(gradeName =>
+    getGradeRoleNames(gradeName).includes(normalizeGradeRoleName(roleName))
+  );
+}
+
+function findGradeRole(guild, roleName, allowedNames) {
+  const normalizedName = normalizeGradeRoleName(roleName);
+  if (allowedNames === GRADE_ROLES) {
+    const matchingNames = getGradeRoleNames(roleName);
+    if (!matchingNames.length) return null;
+    return guild.roles.cache.find(role => matchingNames.includes(normalizeGradeRoleName(role.name))) || null;
+  }
+  if (!allowedNames.some(name => normalizeGradeRoleName(name) === normalizedName)) return null;
+  return guild.roles.cache.find(role => normalizeGradeRoleName(role.name) === normalizedName) || null;
+}
+
+function parseGradeRoleMessage(guild, roleText) {
+  const normalizedText = normalizeGradeRoleName(roleText);
+  const gradeInputs = [...GRADE_ROLES, ...Object.values(GRADE_ROLE_ALIASES).flat()];
+  const gradesByLength = [...new Set(gradeInputs)].sort((left, right) => right.length - left.length);
+
+  for (const gradeName of gradesByLength) {
+    const normalizedGrade = normalizeGradeRoleName(gradeName);
+    if (!normalizedText.startsWith(`${normalizedGrade} `)) continue;
+
+    const subRoles = normalizedText.slice(normalizedGrade.length).trim().split(/\s+/);
+    if (subRoles.length < 2) continue;
+
+    const gradeRole = findGradeRole(guild, gradeName, GRADE_ROLES);
+    const sub1Role = findGradeRole(guild, subRoles[0], SUB1_ROLES);
+    const sub2Role = findGradeRole(guild, subRoles[1], SUB2_ROLES);
+    if (gradeRole && sub1Role && sub2Role) return { gradeRole, sub1Role, sub2Role };
+  }
+
+  return null;
+}
+
+async function doGradeUpdate(guild, moderator, target, gradeRole, sub1Role, sub2Role) {
+  if (!target) return { error: "User not found." };
+  if (!gradeRole || !sub1Role || !sub2Role) return { error: "Choose a valid grade, Sub1, and Sub2 role." };
+  const botMember = guild.members.me;
+  if (!botMember?.permissions.has(PermissionFlagsBits.ManageRoles)) return { error: "I need the Manage Roles permission." };
+
+  const isAllowedRole = (role, names) => names.some(name =>
+    normalizeGradeRoleName(name) === normalizeGradeRoleName(role.name)
+  );
+  if (!isGradeRole(gradeRole.name) ||
+      !isAllowedRole(sub1Role, SUB1_ROLES) ||
+      !isAllowedRole(sub2Role, SUB2_ROLES)) {
+    return { error: "The selected roles must be one valid Grade, Sub1, and Sub2 role." };
+  }
+
+  const selectedRoleIds = new Set([gradeRole.id, sub1Role.id, sub2Role.id]);
+  const selectedRoles = [gradeRole, sub1Role, sub2Role];
+  const unmanageableRole = selectedRoles.find(role =>
+    !role.editable || role.comparePositionTo(botMember.roles.highest) >= 0
+  );
+  if (unmanageableRole) {
+    return { error: `I can't manage ${unmanageableRole.name} because it's above or equal to my top role.` };
+  }
+
+  const oldRoles = target.roles.cache.filter(role =>
+    isGradeRole(role.name) ||
+    SUB1_ROLES.some(name => normalizeGradeRoleName(name) === normalizeGradeRoleName(role.name)) ||
+    SUB2_ROLES.some(name => normalizeGradeRoleName(name) === normalizeGradeRoleName(role.name))
+  );
+  const rolesToRemove = oldRoles.filter(role =>
+    !selectedRoleIds.has(role.id) &&
+    role.editable &&
+    role.id !== guild.roles.everyone.id
+  );
+
+  try {
+    await target.roles.add(selectedRoles, `Grade roles updated by ${moderator.user.tag}`);
+    if (rolesToRemove.size > 0) {
+      await target.roles.remove(rolesToRemove, `Replaced by grade roles selected by ${moderator.user.tag}`);
+    }
+  } catch (error) {
+    console.error("Grade role update failed:", error);
+    return { error: "I couldn't fully update the grade roles. Check my Manage Roles permission and role hierarchy." };
+  }
+
+  const removedNames = [...rolesToRemove.values()].map(role => role.name);
+  const selectedNames = selectedRoles.map(role => role.name);
+  addModLog(guild.id, "grade", target.id, moderator.id, `Assigned: ${selectedNames.join(", ")}; removed: ${removedNames.join(", ") || "none"}`);
+
+  return {
+    embed: publicEmbed("🎓 Grade Roles Updated", `${userMention(target.id)}'s grade roles were updated.`, 0x57F287).addFields(
+      { name: "Grade", value: gradeRole.name, inline: true },
+      { name: "Sub1", value: sub1Role.name, inline: true },
+      { name: "Sub2", value: sub2Role.name, inline: true },
+      { name: "Removed old roles", value: removedNames.length ? removedNames.join(", ") : "None", inline: false },
+      { name: "Updated By", value: userMention(moderator.id), inline: true }
+    )
+  };
+}
+
 async function doTempRole(guild, moderator, target, role, duration, reason) {
   if (!target) return { error: "User not found." };
   if (!role) return { error: "Role not found." };
@@ -1808,6 +1921,7 @@ function helpEmbed() {
         "**/serverlogs** — Sets or checks the channel for server audit logs.",
         "**/userinfo** — Shows a member's profile, join date, account age, and roles.",
         "**/autoping** — Enables or disables join pings in a chosen channel.",
+        "**/gradechannel** — Sets or displays the only channel where grade assignments work.",
         "**/setup** — Opens the bot setup menu.",
         "**/logs** — Shows recent moderation and security events."
       ].join("\n"),
@@ -1848,8 +1962,7 @@ function helpEmbed() {
       value: [
         "**/raid** — Manually enables or disables raid protection.",
         "**/whitelist** — Manages anti-nuke exemptions.",
-        "**/honeypot** — Configures a monitored channel that removes messages and kicks non-admin posters.",
-        "**/testsecuritydm** — Sends administrators a test DM."
+        "**/honeypot** — Configures a monitored channel that removes messages and kicks non-admin posters."
       ].join("\n"),
       inline: false
     },
@@ -1861,7 +1974,8 @@ function helpEmbed() {
         "**/unlock** — Restores @everyone's ability to send messages.",
         "**/addrole** — Adds a role to a user.",
         "**/removerole** — Removes a role from a user.",
-        "**/temprole** — Adds a temporary role for a set duration."
+        "**/temprole** — Adds a temporary role for a set duration.",
+        "**Grade assignment** — Mention a member followed by grade, Sub1, and Sub2 names, e.g. `@user semi g1 low strong`. Use `spg` for Special Grade."
       ].join("\n"),
       inline: false
     }
@@ -2036,6 +2150,7 @@ async function registerCommands() {
     new SlashCommandBuilder().setName("help").setDescription("Show bot commands and help information"),
     new SlashCommandBuilder().setName("serverinfo").setDescription("Show information about this server"),
     new SlashCommandBuilder().setName("serverlogs").setDescription("Configure server audit logs for moderation and server changes").addChannelOption(option => option.setName("channel").setDescription("Channel for audit log entries").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(false)).addBooleanOption(option => option.setName("enabled").setDescription("Enable or disable audit logging").setRequired(false)),
+    new SlashCommandBuilder().setName("gradechannel").setDescription("Set or view the only channel where grade assignments work").addChannelOption(option => option.setName("channel").setDescription("Channel where grade role assignments are allowed").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(false)),
     new SlashCommandBuilder().setName("userinfo").setDescription("Show information about a server member").addUserOption(option => option.setName("user").setDescription("Member to inspect; defaults to you").setRequired(false)),
     new SlashCommandBuilder().setName("autoping").setDescription("Enable or disable auto-pinging new members in a channel").addChannelOption(option => option.setName("channel").setDescription("Channel to ghost ping when a member joins").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(false)).addBooleanOption(option => option.setName("enabled").setDescription("Turn the join ping on or off").setRequired(false)),
     new SlashCommandBuilder().setName("setup").setDescription("Configure the bot"),
@@ -2111,6 +2226,35 @@ client.on("interactionCreate", async interaction => {
 
       if (command === "serverinfo") {
         return interaction.reply({ embeds: [serverInfoEmbed(guild)] });
+      }
+
+      if (command === "gradechannel") {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+          return interaction.reply({ embeds: [errorEmbed("You need Manage Server permission to configure `/gradechannel`.")], ephemeral: true });
+        }
+
+        const channel = interaction.options.getChannel("channel");
+        if (channel) {
+          ensureSettings(guild.id);
+          const botMember = guild.members.me;
+          const botPermissions = botMember ? channel.permissionsFor(botMember) : null;
+          if (!botPermissions?.has(PermissionFlagsBits.ViewChannel) ||
+              !botPermissions.has(PermissionFlagsBits.SendMessages) ||
+              !botPermissions.has(PermissionFlagsBits.EmbedLinks) ||
+              !botPermissions.has(PermissionFlagsBits.AddReactions)) {
+            return interaction.reply({
+              embeds: [errorEmbed("I need View Channel, Send Messages, Embed Links, and Add Reactions permissions in the grade channel.")],
+              ephemeral: true
+            });
+          }
+          db.prepare("UPDATE settings SET grade_channel_id = ? WHERE guild_id = ?").run(channel.id, guild.id);
+        }
+
+        const configuredChannel = getSettings(guild.id).grade_channel_id;
+        const description = configuredChannel
+          ? `Grade assignments work only in ${channelMention(configuredChannel)}. Messages in other channels are ignored.`
+          : "No grade channel is configured. Set one with `/gradechannel channel:#channel`.";
+        return interaction.reply({ embeds: [publicEmbed("🎓 Grade Channel", description, 0x5865F2)], ephemeral: true });
       }
 
       if (command === "serverlogs") {
@@ -2995,7 +3139,7 @@ client.on("interactionCreate", async interaction => {
         const transaction = db.transaction(() => {
           db.prepare(`DELETE FROM command_roles WHERE guild_id = ?`).run(guildId);
           db.prepare(`DELETE FROM prefixes WHERE guild_id = ?`).run(guildId);
-          db.prepare(`UPDATE settings SET blacklist_channel_id = NULL, unblacklist_channel_id = NULL, log_channel_id = NULL, log_events_json = NULL, server_log_channel_id = NULL, server_logs_enabled = 0, appeal_link = NULL, setup_complete = 0 WHERE guild_id = ?`).run(guildId);
+          db.prepare(`UPDATE settings SET blacklist_channel_id = NULL, unblacklist_channel_id = NULL, log_channel_id = NULL, log_events_json = NULL, server_log_channel_id = NULL, server_logs_enabled = 0, grade_channel_id = NULL, appeal_link = NULL, setup_complete = 0 WHERE guild_id = ?`).run(guildId);
         });
 
         transaction();
@@ -3211,6 +3355,37 @@ client.on("messageCreate", async message => {
     }
 
     return;
+  }
+
+  const gradeMessageMatch = message.content.match(/^<@!?(\d+)>\s+(.+)$/s);
+  if (gradeMessageMatch && getSettings(message.guild.id).grade_channel_id === message.channelId) {
+    const target = await message.guild.members.fetch(gradeMessageMatch[1]).catch(() => null);
+    const gradeRoles = parseGradeRoleMessage(message.guild, gradeMessageMatch[2]);
+    if (target && gradeRoles) {
+      if (!hasCommandAccess(message, "grade")) {
+        return message.reply({ embeds: [errorEmbed("You don't have permission to assign grade roles.")] });
+      }
+
+      const result = await doGradeUpdate(
+        message.guild,
+        message.member,
+        target,
+        gradeRoles.gradeRole,
+        gradeRoles.sub1Role,
+        gradeRoles.sub2Role
+      );
+      if (result.error) {
+        return message.reply({ embeds: [errorEmbed(result.error)] });
+      }
+
+      const response = await message.reply({ embeds: [result.embed] });
+      try {
+        await response.react("✅");
+      } catch (error) {
+        console.warn("Could not add the grade assignment confirmation reaction:", error);
+      }
+      return;
+    }
   }
 
   const prefixes = getPrefixes(message.guild.id);
